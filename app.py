@@ -2,97 +2,115 @@ import streamlit as st
 import requests
 import pandas as pd
 
-st.set_page_config(page_title="全球股息估值-全自動修復版", layout="centered")
+# 網頁設定
+st.set_page_config(page_title="全球股息估值-三引擎版", layout="centered")
 
-# --- 讀取所有可用 API ---
+# --- 安全讀取 Secrets ---
 try:
-    FINNHUB_KEY = st.secrets["FINNHUB_KEY"]
-    FMP_KEY = st.secrets["FMP_KEY"]
+    FINNHUB_KEY = st.secrets.get("FINNHUB_KEY", "")
+    ITICK_KEY = st.secrets.get("ITICK_KEY", "")
 except:
-    st.error("❌ 請確保 Secrets 中有 FINNHUB_KEY 與 FMP_KEY。")
-    st.stop()
+    st.warning("⚠️ 部分 API Key 尚未設定，可能影響自動抓取功能。")
 
-st.title("💰 股息估值工具 (全自動抓取引擎)")
+st.title("💰 股息估值工具 (三引擎整合版)")
 
-# --- 1. 使用者輸入 ---
+# --- 1. 使用者輸入與引擎選擇 ---
 market = st.radio("選擇市場", ["台股 (TW)", "美股 (US)"], horizontal=True)
-ticker = st.text_input("輸入股票代碼", value="2330" if market == "台股 (TW)" else "AAPL").upper().strip()
-analyze_btn = st.button("執行深度分析", type="primary")
 
-# --- 2. 鋼鐵抓取邏輯 ---
+if market == "台股 (TW)":
+    tw_engine = st.selectbox("台股數據源", ["官方直連 (免Key/最穩)", "iTick (自動股息/有期限)"])
+else:
+    us_engine = "Finnhub (自動抓取)"
 
-def fetch_tw_data_robust(symbol):
-    """台股多源抓取邏輯"""
-    # 路徑 A: FMP (加上 .TW 或 .TWO 判定)
-    for suffix in [".TW", ".TWO"]:
-        f_url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}{suffix}?apikey={FMP_KEY}"
-        try:
-            res = requests.get(f_url, timeout=5).json()
-            if res and isinstance(res, list):
-                return res[0].get("price"), res[0].get("dividend"), "FMP"
-        except: continue
+col1, col2 = st.columns([3, 1])
+with col1:
+    default_ticker = "2330" if market == "台股 (TW)" else "AAPL"
+    ticker = st.text_input("輸入股票代碼", value=default_ticker).upper().strip()
+with col2:
+    st.write(" ")
+    btn = st.button("執行分析", use_container_width=True, type="primary")
 
-    # 路徑 B: 官方證交所直連 (如果 FMP 失敗)
-    twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL"
+# --- 側邊欄：手動補入區 (所有引擎的最後防線) ---
+st.sidebar.header("🛠️ 數據手動修正")
+manual_price = st.sidebar.number_input("手動股價 (0為自動)", value=0.0)
+manual_div = st.sidebar.number_input("手動年股息 (0為自動)", value=0.0)
+
+# --- 2. 各大引擎函數 ---
+
+def get_tw_official_price(symbol):
+    """引擎 A: 台灣證交所官方直連"""
+    url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL"
     try:
-        res = requests.get(twse_url, timeout=5).json()
+        res = requests.get(url, timeout=10)
+        data = res.json()
         target = next((x for x in data if x['Code'] == symbol), None)
-        if target:
-            # 這裡我們甚至可以加入一個簡單的股息爬取邏輯，或從其他公開 JSON 抓取
-            return float(target['ClosingPrice']), 0, "TWSE_Official"
-    except: pass
-    
-    return None, None, "All Failed"
+        return (float(target['ClosingPrice']), 0.0, None) if target else (0, 0, "找不到代碼")
+    except:
+        return 0, 0, "證交所連線失敗"
 
-def fetch_us_data_robust(symbol):
-    """美股多源抓取邏輯"""
-    # 路徑 A: Finnhub
+def get_tw_itick_data(symbol):
+    """引擎 B: iTick 專業數據"""
+    url = f"https://api.itick.io/v1/quotes/{symbol}?token={ITICK_KEY}"
+    try:
+        res = requests.get(url, timeout=10).json()
+        price = res.get("last", 0)
+        div = res.get("dividend_yield_value", 0.0) or res.get("dividend_per_share", 0.0)
+        return price, div, None
+    except:
+        return 0, 0, "iTick 連線失敗或 Key 已過期"
+
+def get_us_finnhub_data(symbol):
+    """引擎 C: Finnhub 美股數據"""
     q_url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
     d_url = f"https://finnhub.io/api/v1/stock/dividend?symbol={symbol}&token={FINNHUB_KEY}"
     try:
-        q_res = requests.get(q_url, timeout=5).json()
-        d_res = requests.get(d_url, timeout=5).json()
-        if q_res.get('c'):
-            price = q_res['c']
-            div = sum([d['amount'] for d in d_res[:4]]) if isinstance(d_res, list) else 0
-            return price, div, "Finnhub"
-    except: pass
+        q_res = requests.get(q_url, timeout=10).json()
+        price = q_res.get('c', 0)
+        d_res = requests.get(d_url, timeout=10).json()
+        total_div = 0.0
+        if isinstance(d_res, list) and len(d_res) > 0:
+            df = pd.DataFrame(d_res)
+            df['date'] = pd.to_datetime(df['date'])
+            total_div = df[df['date'] > (pd.Timestamp.now() - pd.Timedelta(days=365))]['amount'].sum()
+        return price, total_div, None
+    except:
+        return 0, 0, "Finnhub 連線失敗"
 
-    # 路徑 B: FMP 備援
-    f_url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_KEY}"
-    try:
-        res = requests.get(f_url, timeout=5).json()
-        if res: return res[0].get("price"), res[0].get("dividend"), "FMP"
-    except: pass
-
-    return None, None, "All Failed"
-
-# --- 3. 執行與渲染 ---
-if analyze_btn:
-    with st.spinner(f'正在為您從全球節點抓取 {ticker} 的精確數據...'):
+# --- 3. 執行分析邏輯 ---
+if btn:
+    with st.spinner('正在分析市場數據...'):
         if market == "台股 (TW)":
-            price, div, source = fetch_tw_data_robust(ticker)
+            if tw_engine == "iTick (自動股息/有期限)":
+                a_price, a_div, err = get_tw_itick_data(ticker)
+            else:
+                a_price, a_div, err = get_tw_official_price(ticker)
         else:
-            price, div, source = fetch_us_data_robust(ticker)
+            a_price, a_div, err = get_us_finnhub_data(ticker)
 
-        if price:
-            st.success(f"✅ 成功通過 {source} 引擎獲取數據")
+        final_price = manual_price if manual_price > 0 else a_price
+        final_div = manual_div if manual_div > 0 else a_div
+
+        if final_price == 0:
+            st.error(err if err else "找不到資料")
+            st.info("💡 提示：若 API 失效，請於左側手動輸入數據。")
+        else:
             currency = "NT$" if market == "台股 (TW)" else "$"
+            st.subheader(f"📊 {ticker} 分析結果")
             c1, c2 = st.columns(2)
-            c1.metric("即時股價", f"{currency}{price:.2f}")
-            c2.metric("年度股息", f"{currency}{div:.2f}" if div else "需手動補入")
+            c1.metric("當前股價", f"{currency}{final_price:.2f}")
+            c2.metric("預計年股息", f"{currency}{final_div:.2f}")
             
-            # 股息補全邏輯
-            final_div = div
-            if not div or div == 0:
-                final_div = st.number_input(f"API 暫無該標的股息資料，請補入年度總股息", value=0.0)
-
+            # 高登模型計算
             if final_div > 0:
                 st.divider()
-                r = st.slider("期望回報率 (%)", 5.0, 15.0, 8.0) / 100
-                g = st.slider("永續成長率 (%)", 0.0, 8.0, 3.0) / 100
-                fair_price = (final_div * (1 + g)) / (r - g)
-                st.subheader(f"💡 高登模型估值結果")
-                st.info(f"合理價為 **{currency}{fair_price:.2f}**")
-        else:
-            st.error("🚨 深度抓取失敗。這可能是因為 API 額度用盡或該代碼暫時被封鎖。")
+                r = st.slider("期望回報率 (%)", 5.0, 15.0, 8.0, 0.5) / 100
+                g = st.slider("預估永續成長率 (%)", 0.0, 8.0, 3.0, 0.5) / 100
+                if r > g:
+                    fair_price = (final_div * (1 + g)) / (r - g)
+                    st.info(f"💡 預估合理價：**{currency}{fair_price:.2f}**")
+                    if final_price < fair_price:
+                        st.success("🔥 股價低於合理價 (適合分批布局)")
+                    else:
+                        st.warning("💎 股價目前高於估值")
+            else:
+                st.warning("⚠️ 缺少年股息數據，無法計算合理價。請在左側手動補入。")
